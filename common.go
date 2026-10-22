@@ -113,8 +113,64 @@ const (
 	tagNumExpectedLaterEncodingBase64URL = 21
 	tagNumExpectedLaterEncodingBase64    = 22
 	tagNumExpectedLaterEncodingBase16    = 23
-	tagNumSelfDescribedCBOR              = 55799
+
+	// CBOR tags for sharing identical values, as defined by the value
+	// sharing extension (https://cbor.schmorp.de/value-sharing) and
+	// implemented by CBOR codecs such as CBOR::XS and cbor2.
+	tagNumShareable          = 28  // tag 28 marks its content as a shareable value
+	tagNumSharedRef          = 29  // tag 29 references a previously marked value by index
+	tagNumSharedRefNamespace = 296 // tag 296 starts a nested reference namespace
+
+	tagNumSelfDescribedCBOR = 55799
 )
+
+// SharedReferenceError describes an illegal CBOR shared value reference
+// (tag 29), such as a reference that doesn't enclose an unsigned integer
+// index or an index that doesn't refer to a shareable value (tag 28)
+// encountered earlier within the same CBOR data item.
+type SharedReferenceError struct {
+	msg string
+}
+
+func (e *SharedReferenceError) Error() string {
+	return "cbor: invalid shared reference: " + e.msg
+}
+
+// ValueSharingMode specifies whether Go object identity is preserved using
+// CBOR shareable (tag 28) and sharedref (tag 29) tags.
+//
+// See https://cbor.schmorp.de/value-sharing for details of the tags.
+type ValueSharingMode int
+
+const (
+	// ValueSharingNone doesn't emit or resolve tags 28 and 29.  Repeated Go
+	// references are encoded independently, and cyclic Go values cannot be
+	// encoded.  It is the default.
+	ValueSharingNone ValueSharingMode = iota
+
+	// ValueSharingAllowed preserves object identity of duplicate references
+	// (pointers, maps, and slices) and supports cyclic Go values.
+	//
+	// When encoding, the first occurrence of a reference value is wrapped in
+	// tag 28 and assigned the next zero-based index; every later occurrence
+	// is replaced by tag 29 carrying that index.  Index numbering follows
+	// encoding order, so output is stable when encoding traversal is
+	// deterministic (i.e. Sort is not SortNone or SortFastShuffle).  The
+	// index table is scoped to a single top-level CBOR data item, so
+	// consecutive data items never share indices.
+	//
+	// When decoding, tag 29 is resolved to the Go value marked by the
+	// referenced tag 28, including forward references that form cycles.
+	// References to unknown or non-unsigned indices fail with
+	// *SharedReferenceError.
+	ValueSharingAllowed
+
+	maxValueSharingMode
+)
+
+func (m ValueSharingMode) valid() bool {
+	return m >= 0 && m < maxValueSharingMode
+}
 
 const (
 	cborBreakFlag = byte(0xff)

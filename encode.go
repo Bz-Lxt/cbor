@@ -631,6 +631,15 @@ type EncOptions struct {
 
 	// ToIndefArrayStructTag specifies whether the `toindefarray` struct tag option is honored.
 	ToIndefArrayStructTag ToIndefArrayStructTagMode
+
+	// ValueSharing specifies whether duplicate Go references (pointers, maps,
+	// and slices) are encoded once and referenced later using CBOR tags 28
+	// (shareable) and 29 (sharedref), which also allows cyclic Go values to be
+	// encoded.
+	//
+	// ValueSharing cannot be enabled together with TagsForbidden or
+	// SortFastShuffle.  Also see ValueSharingMode.
+	ValueSharing ValueSharingMode
 }
 
 // CanonicalEncOptions returns EncOptions for "Canonical CBOR" encoding,
@@ -856,6 +865,17 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 	if opts.IndefLength == IndefLengthForbidden && opts.ToIndefArrayStructTag == ToIndefArrayStructTagAllowed {
 		return nil, errors.New("cbor: cannot set ToIndefArrayStructTag to ToIndefArrayStructTagAllowed when IndefLength is IndefLengthForbidden")
 	}
+	if !opts.ValueSharing.valid() {
+		return nil, errors.New("cbor: invalid ValueSharing " + strconv.Itoa(int(opts.ValueSharing)))
+	}
+	if opts.ValueSharing == ValueSharingAllowed {
+		if opts.TagsMd == TagsForbidden {
+			return nil, errors.New("cbor: cannot set ValueSharing to ValueSharingAllowed when TagsMd is TagsForbidden")
+		}
+		if opts.Sort == SortFastShuffle {
+			return nil, errors.New("cbor: cannot set ValueSharing to ValueSharingAllowed when Sort is SortFastShuffle")
+		}
+	}
 	em := encMode{
 		sort:                      opts.Sort,
 		shortestFloat:             opts.ShortestFloat,
@@ -878,6 +898,7 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 		textMarshaler:             opts.TextMarshaler,
 		jsonMarshalerTranscoder:   opts.JSONMarshalerTranscoder,
 		toIndefArrayStructTag:     opts.ToIndefArrayStructTag,
+		valueSharing:              opts.ValueSharing,
 	}
 	return &em, nil
 }
@@ -926,6 +947,13 @@ type encMode struct {
 	textMarshaler             TextMarshalerMode
 	jsonMarshalerTranscoder   Transcoder
 	toIndefArrayStructTag     ToIndefArrayStructTagMode
+	valueSharing              ValueSharingMode
+
+	// encSharing holds per-top-level-data-item identity state and is nil
+	// unless valueSharing is ValueSharingAllowed and the encMode is a
+	// private per-encode-run copy.  It must never be set on an encMode
+	// returned to users so modes stay safe for concurrent use.
+	encSharing *encodeSharingState
 }
 
 var defaultEncMode, _ = EncOptions{}.encMode()
@@ -1021,10 +1049,24 @@ func (em *encMode) EncOptions() EncOptions {
 		TextMarshaler:           em.textMarshaler,
 		JSONMarshalerTranscoder: em.jsonMarshalerTranscoder,
 		ToIndefArrayStructTag:   em.toIndefArrayStructTag,
+		ValueSharing:            em.valueSharing,
 	}
 }
 
 func (em *encMode) unexport() {}
+
+// beginEncodeRun returns em itself when value sharing is disabled, or a
+// private copy of em with a fresh shareable-value index table when value
+// sharing is enabled.  The fresh table isolates identity numbering between
+// concurrent and consecutive top-level data items, keeping output stable.
+func (em *encMode) beginEncodeRun() *encMode {
+	if em.valueSharing != ValueSharingAllowed {
+		return em
+	}
+	e := *em
+	e.encSharing = newEncodeSharingState()
+	return &e
+}
 
 func (em *encMode) appendTagBytes(dst []byte, v reflect.Value) []byte {
 	if em.tags != nil {
@@ -1046,16 +1088,17 @@ func (em *encMode) appendTagBytesSlow(dst []byte, v reflect.Value) []byte {
 func (em *encMode) Marshal(v any) ([]byte, error) {
 	bp := getEncodeBuffer()
 
+	runEM := em.beginEncodeRun()
 	rv := reflect.ValueOf(v)
 
 	var b []byte
 	var handled bool
 	var err error
-	if tryFastPath(rv) {
-		b, handled, err = fastEncode(*bp, em, v)
+	if tryFastPath(rv) && runEM.encSharing == nil {
+		b, handled, err = fastEncode(*bp, runEM, v)
 	}
 	if !handled {
-		b, err = encode(*bp, em, rv)
+		b, err = encode(*bp, runEM, rv)
 	}
 	*bp = b[:0]
 	if err != nil {
@@ -1082,16 +1125,17 @@ func (em *encMode) MarshalToBuffer(v any, buf *bytes.Buffer) error {
 		return errors.New("cbor: encoding buffer provided by user is nil")
 	}
 
+	runEM := em.beginEncodeRun()
 	rv := reflect.ValueOf(v)
 
 	var b []byte
 	var handled bool
 	var err error
-	if tryFastPath(rv) {
-		b, handled, err = fastEncode(buf.AvailableBuffer(), em, v)
+	if tryFastPath(rv) && runEM.encSharing == nil {
+		b, handled, err = fastEncode(buf.AvailableBuffer(), runEM, v)
 	}
 	if !handled {
-		b, err = encode(buf.AvailableBuffer(), em, rv)
+		b, err = encode(buf.AvailableBuffer(), runEM, rv)
 	}
 	if err != nil {
 		return err
@@ -1123,6 +1167,100 @@ func getEncodeBuffer() *[]byte {
 
 func putEncodeBuffer(bp *[]byte) {
 	encodeBufferPool.Put(bp)
+}
+
+// encodeSharingState keeps the per-top-level-CBOR-data-item table that maps
+// identity of Go reference values (pointers, maps, and slices) to the index
+// of their shareable tag (tag 28).  A fresh state is allocated for every
+// top-level Encode/Marshal call, which isolates concurrent calls and
+// consecutive data items and makes identity numbering stable.
+type encodeSharingState struct {
+	seen map[encIdentityKey]int
+	next int
+}
+
+// encIdentityKey identifies a Go reference value.  The length is part of
+// the key for slices so different slices backed by the same array don't
+// collapse into one identity.
+type encIdentityKey struct {
+	ptr uintptr
+	n   int
+}
+
+func newEncodeSharingState() *encodeSharingState {
+	return &encodeSharingState{seen: make(map[encIdentityKey]int)}
+}
+
+// ref returns the shareable index for key.  The first occurrence is marked
+// with the next index; later occurrences return the existing index and
+// isReference is true.
+func (st *encodeSharingState) ref(key encIdentityKey) (index int, isReference bool) {
+	if index, ok := st.seen[key]; ok {
+		return index, true
+	}
+	index = st.next
+	st.next++
+	st.seen[key] = index
+	return index, false
+}
+
+// reserve advances the index table by n.  It's used to account for
+// shareable tags produced opaquely by types implementing Marshaler, whose
+// encoded data item forms a nested scope that the outer encoder can't see
+// into but wire-order decoders will count.
+func (st *encodeSharingState) reserve(n int) {
+	st.next += n
+}
+
+func pointerIdentityKey(v reflect.Value) encIdentityKey {
+	return encIdentityKey{ptr: v.Pointer()}
+}
+
+func mapIdentityKey(v reflect.Value) encIdentityKey {
+	return encIdentityKey{ptr: v.Pointer()}
+}
+
+func sliceIdentityKey(v reflect.Value) encIdentityKey {
+	return encIdentityKey{ptr: v.Pointer(), n: v.Len()}
+}
+
+// appendShareableTag appends tag 28 (shareable).
+func appendShareableTag(dst []byte) []byte {
+	return append(dst, byte(cborTypeTag|additionalInformationWith1ByteArgument), byte(tagNumShareable))
+}
+
+// appendSharedRefTag appends tag 29 (sharedref) enclosing unsigned index.
+func appendSharedRefTag(dst []byte, index int) []byte {
+	dst = append(dst, byte(cborTypeTag|additionalInformationWith1ByteArgument), byte(tagNumSharedRef))
+	return appendHead(dst, byte(cborTypePositiveInt), uint64(index)) //nolint:gosec
+}
+
+// encodeIndirectValue encodes v after unwrapping non-nil pointers.  When
+// value sharing is enabled every first-seen non-nil pointer level is
+// wrapped in a shareable tag (tag 28) and assigned the next index, while
+// repeated pointer levels become shared references (tag 29); this is what
+// terminates recursion into cyclic values.  When value sharing is disabled
+// it behaves as a plain pointer dereference and emits cbor nil for nil
+// pointers.
+func encodeIndirectValue(f encodeFunc, dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
+	st := em.encSharing
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return append(dst, cborNil), nil
+		}
+		if st != nil {
+			key := pointerIdentityKey(v)
+			if index, ok := st.seen[key]; ok {
+				return appendSharedRefTag(dst, index), nil
+			}
+			index := st.next
+			st.next++
+			st.seen[key] = index
+			dst = appendShareableTag(dst)
+		}
+		v = v.Elem()
+	}
+	return f(dst, em, v)
 }
 
 type encodeFunc func(dst []byte, em *encMode, v reflect.Value) ([]byte, error)
@@ -1378,6 +1516,17 @@ type arrayEncodeFunc struct {
 
 // NOTE: arrayEncodeFunc.encode must be in sync with appendSliceAnyWithEM and produce the same encoded data.
 func (ae arrayEncodeFunc) encode(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
+	if st := em.encSharing; st != nil && v.Kind() == reflect.Slice && !v.IsNil() && v.Len() > 0 {
+		// Only slices have reference identity; fixed-size arrays don't.
+		key := sliceIdentityKey(v)
+		if index, ok := st.seen[key]; ok {
+			return appendSharedRefTag(dst, index), nil
+		}
+		index := st.next
+		st.next++
+		st.seen[key] = index
+		dst = appendShareableTag(dst)
+	}
 	if em.byteArray == ByteArrayToByteSlice && v.Type().Elem().Kind() == reflect.Uint8 {
 		return encodeByteArrayAsByteString(dst, em, v)
 	}
@@ -1413,6 +1562,16 @@ type mapEncodeFunc struct {
 // NOTE: mapEncodeFunc.encode must be in sync with appendMapAnyAnyWithEM, appendMapStringAnyWithEM,
 // appendMapStringStringWithEM and produce the same encoded data.
 func (me mapEncodeFunc) encode(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
+	if st := em.encSharing; st != nil && !v.IsNil() {
+		key := mapIdentityKey(v)
+		if index, ok := st.seen[key]; ok {
+			return appendSharedRefTag(dst, index), nil
+		}
+		index := st.next
+		st.next++
+		st.seen[key] = index
+		dst = appendShareableTag(dst)
+	}
 	if v.IsNil() && em.nilContainers == NilContainerAsNull {
 		dst = append(dst, cborNil)
 		return dst, nil
@@ -1425,6 +1584,11 @@ func (me mapEncodeFunc) encode(dst []byte, em *encMode, v reflect.Value) ([]byte
 	}
 
 	dst = appendHead(dst, byte(cborTypeMap), uint64(mlen)) //nolint:gosec
+	if em.encSharing != nil && (em.sort == SortLengthFirst || em.sort == SortBytewiseLexical) && mlen > 1 {
+		// Encode in sorted order up front so shareable indices are assigned
+		// in final output order, independently of Go map iteration order.
+		return encodeSortedMapKeyValuesShared(dst, em, v)
+	}
 	if em.sort == SortNone || em.sort == SortFastShuffle || mlen <= 1 {
 		return me.e(dst, em, v, nil)
 	}
@@ -2066,8 +2230,61 @@ func encodeMarshalerType(dst []byte, em *encMode, v reflect.Value) ([]byte, erro
 		return dst, &MarshalerError{typ: v.Type(), err: err}
 	}
 
+	if em.encSharing != nil {
+		// Marshaler output is an opaque nested encoding boundary, but its
+		// shareable tags still occupy wire-order indices in the enclosing
+		// data item, so advance the table to keep later indices stable.
+		em.encSharing.reserve(countShareableTags(data))
+	}
+
 	dst = append(dst, data...)
 	return dst, nil
+}
+
+// countShareableTags counts tag 28 (shareable) markers in one well-formed
+// CBOR data item belonging to the current namespace.  Markers nested inside
+// tag 296 (sharedref-namespace) content are not counted because they belong
+// to an isolated namespace, matching encoder/decoder scope semantics.  It's
+// used to keep the index table aligned with data produced opaquely by types
+// implementing Marshaler or with data skipped by the decoder.
+func countShareableTags(data []byte) int {
+	d := decoder{data: data}
+	n := 0
+	var walk func(count bool)
+	walk = func(count bool) {
+		t, _, val, indefiniteLength := d.readHeadWithIndefiniteLengthFlag()
+		if indefiniteLength {
+			for !isBreakFlag(d.data[d.off]) {
+				walk(count)
+			}
+			d.off++
+			return
+		}
+		switch t {
+		case cborTypeByteString, cborTypeTextString:
+			d.off += int(val) //nolint:gosec
+		case cborTypeArray:
+			for range int(val) { //nolint:gosec
+				walk(count)
+			}
+		case cborTypeMap:
+			for range int(val) * 2 { //nolint:gosec
+				walk(count)
+			}
+		case cborTypeTag:
+			if count && val == tagNumShareable {
+				n++
+			}
+			if val == tagNumSharedRefNamespace {
+				// The namespace content has its own independent index table.
+				walk(false)
+			} else {
+				walk(count)
+			}
+		}
+	}
+	walk(true)
+	return n
 }
 
 func encodeTag(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
@@ -2091,6 +2308,20 @@ func encodeTag(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
 	// Marshal tag number
 	dst = appendHead(dst, byte(cborTypeTag), t.Number)
 
+	if em.encSharing != nil {
+		switch t.Number {
+		case tagNumShareable:
+			// Account for an explicitly emitted shareable tag so automatically
+			// assigned indices stay in sync with wire order.
+			em.encSharing.reserve(1)
+		case tagNumSharedRefNamespace:
+			// The content gets an isolated identity namespace.
+			vem := *em
+			vem.encSharing = newEncodeSharingState()
+			return encode(dst, &vem, reflect.ValueOf(t.Content))
+		}
+	}
+
 	vem := *em // shallow copy
 
 	// For built-in tags, disable settings that may introduce tag validity errors when
@@ -2105,7 +2336,7 @@ func encodeTag(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
 	}
 
 	// Marshal tag content
-	if enableEncodingFastPath {
+	if enableEncodingFastPath && vem.encSharing == nil {
 		return appendAnyWithEM(dst, &vem, t.Content)
 	}
 	return encode(dst, &vem, reflect.ValueOf(t.Content))
@@ -2353,14 +2584,7 @@ func getEncodeIndirectValueFunc(t reflect.Type, newEncodeFuncs map[reflect.Type]
 		return nil
 	}
 	return func(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
-		for v.Kind() == reflect.Pointer && !v.IsNil() {
-			v = v.Elem()
-		}
-		if v.Kind() == reflect.Pointer && v.IsNil() {
-			dst = append(dst, cborNil)
-			return dst, nil
-		}
-		return f(dst, em, v)
+		return encodeIndirectValue(f, dst, em, v)
 	}
 }
 
@@ -2578,7 +2802,7 @@ func encodeAny(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
 
 	var handled bool
 	var err error
-	if tryFastPath(e) {
+	if tryFastPath(e) && em.encSharing == nil {
 		dst, handled, err = fastEncode(dst, em, v.Interface())
 	}
 	if !handled {

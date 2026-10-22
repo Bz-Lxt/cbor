@@ -137,6 +137,18 @@ func appendSliceAnyWithEM(dst []byte, em *encMode, v []any) ([]byte, error) {
 		return dst, nil
 	}
 
+	if st := em.encSharing; st != nil {
+		rv := reflect.ValueOf(v)
+		key := sliceIdentityKey(rv)
+		if index, ok := st.seen[key]; ok {
+			return appendSharedRefTag(dst, index), nil
+		}
+		index := st.next
+		st.next++
+		st.seen[key] = index
+		dst = appendShareableTag(dst)
+	}
+
 	var err error
 	dst = appendHead(dst, byte(cborTypeArray), uint64(len(v)))
 	for _, elem := range v {
@@ -183,14 +195,31 @@ func appendMapAnyAnyWithEM(dst []byte, em *encMode, m map[any]any) ([]byte, erro
 		return dst, nil
 	}
 
+	if st := em.encSharing; st != nil {
+		rv := reflect.ValueOf(m)
+		key := mapIdentityKey(rv)
+		if index, ok := st.seen[key]; ok {
+			return appendSharedRefTag(dst, index), nil
+		}
+		index := st.next
+		st.next++
+		st.seen[key] = index
+		dst = appendShareableTag(dst)
+	}
+
 	var err error
 	mlen := len(m)
 	dst = appendHead(dst, byte(cborTypeMap), uint64(mlen))
+	if em.encSharing != nil && (em.sort == SortLengthFirst || em.sort == SortBytewiseLexical) && mlen > 1 {
+		return encodeSortedMapKeyValuesShared(dst, em, reflect.ValueOf(m))
+	}
 	if em.sort == SortNone || em.sort == SortFastShuffle || mlen <= 1 {
 		for k, v := range m {
-			// Encode map key
-			dst, err = appendAnyWithEM(dst, em, k)
-			if err != nil {
+			// Encode map key with sharing tracking suspended.
+			if err = suspendKeySharing(em, func() error {
+				dst, err = appendAnyWithEM(dst, em, k)
+				return err
+			}); err != nil {
 				return dst, err
 			}
 
@@ -243,6 +272,18 @@ func appendMapStringAnyWithEM(dst []byte, em *encMode, m map[string]any) ([]byte
 		return dst, nil
 	}
 
+	if st := em.encSharing; st != nil {
+		rv := reflect.ValueOf(m)
+		key := mapIdentityKey(rv)
+		if index, ok := st.seen[key]; ok {
+			return appendSharedRefTag(dst, index), nil
+		}
+		index := st.next
+		st.next++
+		st.seen[key] = index
+		dst = appendShareableTag(dst)
+	}
+
 	var err error
 	mlen := len(m)
 	dst = appendHead(dst, byte(cborTypeMap), uint64(mlen))
@@ -282,6 +323,18 @@ func appendMapStringStringWithEM(dst []byte, em *encMode, m map[string]string) (
 	dst, done = appendNilOrEmptyContainer(dst, em, cborTypeMap, m)
 	if done {
 		return dst, nil
+	}
+
+	if st := em.encSharing; st != nil {
+		rv := reflect.ValueOf(m)
+		key := mapIdentityKey(rv)
+		if index, ok := st.seen[key]; ok {
+			return appendSharedRefTag(dst, index), nil
+		}
+		index := st.next
+		st.next++
+		st.seen[key] = index
+		dst = appendShareableTag(dst)
 	}
 
 	mlen := len(m)
@@ -345,6 +398,11 @@ func withSortedKeys[V any](
 }
 
 func appendAnyWithEM(dst []byte, em *encMode, v any) ([]byte, error) {
+	if em.encSharing != nil {
+		// Value sharing needs the reflect encoder's identity hooks, so the
+		// reflect-less fast path is disabled for the whole data item.
+		return encode(dst, em, reflect.ValueOf(v))
+	}
 	dst, handled, err := fastEncode(dst, em, v)
 	if !handled {
 		dst, err = encode(dst, em, reflect.ValueOf(v))

@@ -6510,7 +6510,14 @@ func TestDecOptions(t *testing.T) {
 	for i := range ov.NumField() {
 		fv := ov.Field(i)
 		if fv.IsZero() {
-			t.Errorf("options field %q is unset or set to the zero value for its type", ov.Type().Field(i).Name)
+			fn := ov.Type().Field(i).Name
+			if fn == "ValueSharing" {
+				// Roundtripping non-zero ValueSharing is tested separately
+				// (see TestSharingOptionsRoundtrip) since ValueSharingAllowed
+				// is incompatible with TagsForbidden used above.
+				continue
+			}
+			t.Errorf("options field %q is unset or set to the zero value for its type", fn)
 		}
 	}
 	dm, err := opts1.DecMode()

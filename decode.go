@@ -912,6 +912,14 @@ type DecOptions struct {
 	// implement json.Unmarshaler but do not also implement cbor.Unmarshaler. If nil, decoding
 	// behavior is not influenced by whether or not a type implements json.Unmarshaler.
 	JSONUnmarshalerTranscoder Transcoder
+
+	// ValueSharing specifies whether CBOR shareable (tag 28) and sharedref
+	// (tag 29) tags are resolved to preserve identity of duplicate references
+	// and cycles.  When disabled, the tags are treated as ordinary tags.
+	//
+	// ValueSharing cannot be enabled together with TagsForbidden.  Also see
+	// ValueSharingMode.
+	ValueSharing ValueSharingMode
 }
 
 // DecMode returns DecMode with immutable options and no tags (safe for concurrency).
@@ -1128,6 +1136,13 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		return nil, errors.New("cbor: invalid TextUnmarshaler " + strconv.Itoa(int(opts.TextUnmarshaler)))
 	}
 
+	if !opts.ValueSharing.valid() {
+		return nil, errors.New("cbor: invalid ValueSharing " + strconv.Itoa(int(opts.ValueSharing)))
+	}
+	if opts.ValueSharing == ValueSharingAllowed && opts.TagsMd == TagsForbidden {
+		return nil, errors.New("cbor: cannot set ValueSharing to ValueSharingAllowed when TagsMd is TagsForbidden")
+	}
+
 	dm := decMode{
 		dupMapKey:                 opts.DupMapKey,
 		timeTag:                   opts.TimeTag,
@@ -1157,6 +1172,7 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		binaryUnmarshaler:         opts.BinaryUnmarshaler,
 		textUnmarshaler:           opts.TextUnmarshaler,
 		jsonUnmarshalerTranscoder: opts.JSONUnmarshalerTranscoder,
+		valueSharing:              opts.ValueSharing,
 	}
 
 	return &dm, nil
@@ -1238,6 +1254,7 @@ type decMode struct {
 	binaryUnmarshaler         BinaryUnmarshalerMode
 	textUnmarshaler           TextUnmarshalerMode
 	jsonUnmarshalerTranscoder Transcoder
+	valueSharing              ValueSharingMode
 }
 
 var defaultDecMode, _ = DecOptions{}.decMode()
@@ -1280,6 +1297,7 @@ func (dm *decMode) DecOptions() DecOptions {
 		BinaryUnmarshaler:         dm.binaryUnmarshaler,
 		TextUnmarshaler:           dm.textUnmarshaler,
 		JSONUnmarshalerTranscoder: dm.jsonUnmarshalerTranscoder,
+		ValueSharing:              dm.valueSharing,
 	}
 }
 
@@ -1289,7 +1307,7 @@ func (dm *decMode) DecOptions() DecOptions {
 //
 // See the documentation for Unmarshal for details.
 func (dm *decMode) Unmarshal(data []byte, v any) error {
-	d := decoder{data: data, dm: dm}
+	d := dm.newDecoder(data)
 
 	// Check well-formedness.
 	off := d.off                      // Save offset before data validation
@@ -1302,6 +1320,17 @@ func (dm *decMode) Unmarshal(data []byte, v any) error {
 	return d.value(v)
 }
 
+// newDecoder returns a decoder for data with a fresh per-data-item shared
+// value state, so consecutive and concurrent unmarshals never leak
+// shareable indices into each other.
+func (dm *decMode) newDecoder(data []byte) decoder {
+	d := decoder{data: data, dm: dm}
+	if dm.valueSharing == ValueSharingAllowed {
+		d.sharing = newDecodeSharingState()
+	}
+	return d
+}
+
 // UnmarshalFirst parses the first CBOR data item into the value pointed to by v
 // using dm decoding mode.  Any remaining bytes are returned in rest.
 //
@@ -1309,7 +1338,7 @@ func (dm *decMode) Unmarshal(data []byte, v any) error {
 //
 // See the documentation for Unmarshal for details.
 func (dm *decMode) UnmarshalFirst(data []byte, v any) (rest []byte, err error) {
-	d := decoder{data: data, dm: dm}
+	d := dm.newDecoder(data)
 
 	// check well-formedness.
 	off := d.off                    // Save offset before data validation
@@ -1378,6 +1407,11 @@ type decoder struct {
 	// encoding of the byte strings h'42' and h'43' would be controlled by tag 23 and 21,
 	// respectively.
 	expectedLaterEncodingTags []uint64
+
+	// sharing is the per-decoder shared value (tag 28/29) state.  It's nil
+	// unless value sharing is enabled, and it's reset for every top-level
+	// data item so references never leak across Decode calls.
+	sharing *decodeSharingState
 }
 
 // value decodes CBOR data item into the value pointed to by v.
@@ -1396,7 +1430,10 @@ func (d *decoder) value(v any) error {
 		return &InvalidUnmarshalError{"cbor: Unmarshal(nil " + rv.Type().String() + ")"}
 	}
 	rv = rv.Elem()
-	return d.parseToValue(rv, getTypeInfo(rv.Type()))
+	if err := d.parseToValue(rv, getTypeInfo(rv.Type())); err != nil {
+		return err
+	}
+	return d.checkSharingResolved()
 }
 
 // parseToValue decodes CBOR data to value.  It assumes data is well-formed,
@@ -1418,6 +1455,23 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 		d.skip()
 		v.SetZero()
 		return nil
+	}
+
+	// Intercept value sharing tags 28 (shareable), 29 (sharedref), and 296
+	// (sharedref-namespace) before pointer unwrapping, so the tagged
+	// identity matches Go pointer/container identity.
+	if d.dm.valueSharing == ValueSharingAllowed && d.nextCBORType() == cborTypeTag {
+		off := d.off
+		_, _, tagNum := d.readHead()
+		switch tagNum {
+		case tagNumShareable:
+			return d.parseShareableValue(v, tInfo)
+		case tagNumSharedRef:
+			return d.parseSharedRefValue(v)
+		case tagNumSharedRefNamespace:
+			return d.parseSharedNamespace(v, tInfo)
+		}
+		d.off = off
 	}
 
 	if tInfo.spclType == specialTypeIface {
@@ -2080,6 +2134,32 @@ func (d *decoder) parse(skipSelfDescribedTag bool) (any, error) { //nolint:gocyc
 		_, _, tagNum := d.readHead()
 		contentOff := d.off
 
+		if d.dm.valueSharing == ValueSharingAllowed {
+			// Resolve value sharing tags using the typed machinery with an
+			// addressable interface target, so cycles and duplicate
+			// references keep Go identity.
+			switch tagNum {
+			case tagNumShareable, tagNumSharedRef, tagNumSharedRefNamespace:
+				var x any
+				rv := reflect.ValueOf(&x).Elem()
+				var perr error
+				switch tagNum {
+				case tagNumShareable:
+					perr = d.parseShareableValue(rv, getTypeInfo(typeAny))
+				case tagNumSharedRef:
+					perr = d.parseSharedRefValue(rv)
+				case tagNumSharedRefNamespace:
+					d.sharing.pushScope()
+					perr = d.parseToValue(rv, getTypeInfo(typeAny))
+					d.sharing.popScope()
+				}
+				if perr != nil {
+					return nil, perr
+				}
+				return x, nil
+			}
+		}
+
 		switch tagNum {
 		case tagNumRFC3339Time, tagNumEpochTime:
 			d.off = tagOff
@@ -2401,11 +2481,25 @@ func (d *decoder) parseArray() ([]any, error) {
 	var e any
 	var err, lastErr error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
+		if d.sharing != nil {
+			// Slice elements of a native []any aren't addressable through
+			// reflection, so defer forward-reference insertion by index.
+			idx := i
+			d.sharing.pushSite(decodeSite{assign: func(fill reflect.Value) {
+				v[idx] = fill.Interface()
+			}})
+		}
 		if e, lastErr = d.parse(true); lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
+			if d.sharing != nil {
+				d.sharing.popSite()
+			}
 			continue
+		}
+		if d.sharing != nil {
+			d.sharing.popSite()
 		}
 		v[i] = e
 	}
@@ -2423,6 +2517,11 @@ func (d *decoder) parseArrayToSlice(v reflect.Value, tInfo *typeInfo) error {
 		v.Set(reflect.MakeSlice(tInfo.nonPtrType, count, count))
 	}
 	v.SetLen(count)
+	if d.sharing != nil {
+		// Slice elements are addressable; block enclosing map-value sites.
+		d.sharing.pushSite(decodeSite{})
+		defer d.sharing.popSite()
+	}
 	var err error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
 		if lastErr := d.parseToValue(v.Index(i), tInfo.elemTypeInfo); lastErr != nil {
@@ -2440,6 +2539,10 @@ func (d *decoder) parseArrayToArray(v reflect.Value, tInfo *typeInfo) error {
 	count := int(val) //nolint:gosec
 	gi := 0
 	vLen := v.Len()
+	if d.sharing != nil {
+		d.sharing.pushSite(decodeSite{})
+		defer d.sharing.popSite()
+	}
 	var err error
 	for ci := 0; (hasSize && ci < count) || (!hasSize && !d.foundBreak()); ci++ {
 		if gi < vLen {
@@ -2472,13 +2575,24 @@ func (d *decoder) parseMap() (any, error) {
 	var err, lastErr error
 	keyCount := 0
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
+		if d.sharing != nil {
+			// References inside map keys resolve against the key position
+			// directly, never against an enclosing map value.
+			d.sharing.pushSite(decodeSite{})
+		}
 		// Parse CBOR map key.
 		if k, lastErr = d.parse(true); lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
+			if d.sharing != nil {
+				d.sharing.popSite()
+			}
 			d.skip()
 			continue
+		}
+		if d.sharing != nil {
+			d.sharing.popSite()
 		}
 
 		// Detect if CBOR map key can be used as Go map key.
@@ -2498,11 +2612,25 @@ func (d *decoder) parseMap() (any, error) {
 		}
 
 		// Parse CBOR map value.
+		if d.sharing != nil {
+			// Map values aren't addressable, so defer forward-reference
+			// insertion via SetMapIndex until the tag 28 is decoded.
+			mk, mm := k, m
+			d.sharing.pushSite(decodeSite{assign: func(fill reflect.Value) {
+				mm[mk] = fill.Interface()
+			}})
+		}
 		if e, lastErr = d.parse(true); lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
+			if d.sharing != nil {
+				d.sharing.popSite()
+			}
 			continue
+		}
+		if d.sharing != nil {
+			d.sharing.popSite()
 		}
 
 		// Add key-value pair to Go map.
@@ -2538,6 +2666,13 @@ func (d *decoder) parseMapToMap(v reflect.Value, tInfo *typeInfo) error { //noli
 			mapsize = 0
 		}
 		v.Set(reflect.MakeMapWithSize(tInfo.nonPtrType, mapsize))
+	}
+	if d.sharing != nil {
+		// Block enclosing map-value sites for everything inside this map;
+		// map keys and nested addressable contents set themselves, and
+		// this map's own values push their own insertion sites.
+		d.sharing.pushSite(decodeSite{})
+		defer d.sharing.popSite()
 	}
 	keyType, eleType := tInfo.keyTypeInfo.typ, tInfo.elemTypeInfo.typ
 	var keyValue, eleValue reflect.Value
@@ -2614,7 +2749,22 @@ func (d *decoder) parseMapToMap(v reflect.Value, tInfo *typeInfo) error { //noli
 		} else {
 			eleValue.SetZero()
 		}
-		if lastErr := d.parseToValue(eleValue, tInfo.elemTypeInfo); lastErr != nil {
+		if d.sharing != nil {
+			// Map values can't be patched in place, so a direct forward
+			// reference defers insertion through SetMapIndex.  The key is
+			// copied because keyValue is reused across iterations.
+			keyCopy := reflect.New(keyType).Elem()
+			keyCopy.Set(keyValue)
+			mapValue := v
+			d.sharing.pushSite(decodeSite{assign: func(fill reflect.Value) {
+				mapValue.SetMapIndex(keyCopy, fill)
+			}})
+		}
+		lastErr := d.parseToValue(eleValue, tInfo.elemTypeInfo)
+		if d.sharing != nil {
+			d.sharing.popSite()
+		}
+		if lastErr != nil {
 			if err == nil {
 				err = lastErr
 			}
@@ -2680,6 +2830,10 @@ func (d *decoder) parseArrayToStruct(v reflect.Value, tInfo *typeInfo) error {
 			GoType:   tInfo.typ.String(),
 			errorMsg: "cannot decode CBOR array to struct with different number of elements",
 		}
+	}
+	if d.sharing != nil {
+		d.sharing.pushSite(decodeSite{})
+		defer d.sharing.popSite()
 	}
 	var err, lastErr error
 	for i := 0; (hasSize && i < count) || (!hasSize && !d.foundBreak()); i++ {
@@ -2823,6 +2977,12 @@ func (d *decoder) parseMapToStruct(v reflect.Value, tInfo *typeInfo) error { //n
 	var unmatchedMapKeys map[any]struct{}
 
 	var err error
+
+	if d.sharing != nil {
+		// Struct fields are addressable; references set fields directly.
+		d.sharing.pushSite(decodeSite{})
+		defer d.sharing.popSite()
+	}
 
 	caseInsensitive := d.dm.fieldNameMatching == FieldNameMatchingPreferCaseSensitive
 
@@ -2999,7 +3159,27 @@ func (d *decoder) getRegisteredTagItem(vt reflect.Type) *tagItem {
 
 // skip moves data offset to the next item.  skip assumes data is well-formed,
 // and does not perform bounds checking.
+//
+// When value sharing is enabled, skipped data (e.g. CBOR object members with
+// no matching Go struct field) still contains tag 28 markers that occupy
+// wire-order indices in the current namespace.  They are reserved as opaque
+// so later references don't silently bind to the wrong value.
 func (d *decoder) skip() {
+	if d.sharing == nil {
+		d.skipItem()
+		return
+	}
+	start := d.off
+	d.skipItem()
+	if n := countShareableTags(d.data[start:d.off]); n > 0 {
+		d.sharing.scope().reserveOpaque(n)
+	}
+}
+
+// skipItem moves data offset to the next item without updating the shared
+// value index table.  skipItem assumes data is well-formed, and does not
+// perform bounds checking.
+func (d *decoder) skipItem() {
 	t, _, val, indefiniteLength := d.readHeadWithIndefiniteLengthFlag()
 
 	if indefiniteLength {
@@ -3010,7 +3190,7 @@ func (d *decoder) skip() {
 					d.off++
 					return
 				}
-				d.skip()
+				d.skipItem()
 			}
 		}
 	}
@@ -3021,16 +3201,16 @@ func (d *decoder) skip() {
 
 	case cborTypeArray:
 		for range int(val) { //nolint:gosec
-			d.skip()
+			d.skipItem()
 		}
 
 	case cborTypeMap:
 		for range int(val) * 2 { //nolint:gosec
-			d.skip()
+			d.skipItem()
 		}
 
 	case cborTypeTag:
-		d.skip()
+		d.skipItem()
 	}
 }
 
@@ -3085,10 +3265,12 @@ func (d *decoder) readHead() (t cborType, ai byte, val uint64) {
 }
 
 func (d *decoder) countItemsUntilBreak() int {
+	// This is a lookahead: it must not mutate shared-value index tables,
+	// so items are walked with skipItem rather than skip.
 	savedOff := d.off
 	i := 0
 	for !d.foundBreak() {
-		d.skip()
+		d.skipItem()
 		i++
 	}
 	d.off = savedOff
@@ -3110,6 +3292,272 @@ func (d *decoder) reset(data []byte) {
 	d.data = data
 	d.off = 0
 	d.expectedLaterEncodingTags = d.expectedLaterEncodingTags[:0]
+	if d.dm.valueSharing == ValueSharingAllowed {
+		// Every streamed data item starts with an empty identity table.
+		d.sharing = newDecodeSharingState()
+	} else {
+		d.sharing = nil
+	}
+}
+
+// decodeSharingState keeps tag 28/29 bookkeeping for one top-level CBOR data
+// item.  A fresh state is created for every Unmarshal/Decode call, which
+// isolates consecutive data items.
+type decodeSharingState struct {
+	// scopes is the stack of nested sharedref namespaces; scopes[0] is the
+	// implicit namespace of the top-level data item.
+	scopes []decodeShareScope
+
+	// sites links a forward reference (tag 29 seen before its tag 28) to
+	// the container position that has to be filled once the referenced
+	// value is decoded.  A site with a nil assign function is a blocker
+	// marking addressable contents where values can be set directly.
+	sites []decodeSite
+}
+
+// decodeShareScope is one shared reference namespace.
+type decodeShareScope struct {
+	// boxes holds shareable values indexed by their zero-based tag 28
+	// number.  Entries can exist before being filled (forward reference).
+	boxes     []*shareBox
+	markCount int
+}
+
+// shareBox is one shareable value (one tag 28).
+type shareBox struct {
+	typ    reflect.Type  // Go type the box storage was created for
+	elem   reflect.Value // addressable storage holding the decoded value
+	filled bool
+	// opaque marks positions occupied by tag 28 inside an Unmarshaler
+	// boundary; they can't be materialized so referencing them fails.
+	opaque bool
+	// callbacks assign this value to positions held by forward references.
+	callbacks []func(fill reflect.Value)
+}
+
+// decodeSite defers insertion of a forward-referenced value into the
+// container position currently being decoded.
+type decodeSite struct {
+	assign func(fill reflect.Value)
+}
+
+func newDecodeSharingState() *decodeSharingState {
+	return &decodeSharingState{scopes: []decodeShareScope{{}}}
+}
+
+func (st *decodeSharingState) scope() *decodeShareScope {
+	return &st.scopes[len(st.scopes)-1]
+}
+
+func (st *decodeSharingState) pushScope() {
+	st.scopes = append(st.scopes, decodeShareScope{})
+}
+
+func (st *decodeSharingState) popScope() {
+	st.scopes = st.scopes[:len(st.scopes)-1]
+}
+
+func (st *decodeSharingState) pushSite(s decodeSite) {
+	st.sites = append(st.sites, s)
+}
+
+func (st *decodeSharingState) popSite() {
+	st.sites = st.sites[:len(st.sites)-1]
+}
+
+func (st *decodeSharingState) site() *decodeSite {
+	if len(st.sites) == 0 {
+		return nil
+	}
+	return &st.sites[len(st.sites)-1]
+}
+
+func newShareBox(t reflect.Type) *shareBox {
+	return &shareBox{typ: t, elem: reflect.New(t).Elem()}
+}
+
+// ensureBox returns the box at index, creating a pending box when the
+// reference precedes the shareable value.  It fails when an existing box
+// holds a Go type that can't be assigned to a position of type t.
+func (sc *decodeShareScope) ensureBox(index int, t reflect.Type) (*shareBox, error) {
+	for len(sc.boxes) <= index {
+		sc.boxes = append(sc.boxes, nil)
+	}
+	b := sc.boxes[index]
+	if b == nil {
+		b = newShareBox(t)
+		sc.boxes[index] = b
+		return b, nil
+	}
+	if b.opaque {
+		return b, nil
+	}
+	if !b.typ.AssignableTo(t) {
+		return nil, &SharedReferenceError{msg: fmt.Sprintf(
+			"shared reference index %d carries Go value of type %s, incompatible with %s",
+			index, b.typ, t)}
+	}
+	return b, nil
+}
+
+// reserveOpaque marks n shareable positions as unresolvable.  It's used for
+// regions handed opaquely to UnmarshalCBOR, which still occupy wire-order
+// indices.
+func (sc *decodeShareScope) reserveOpaque(n int) {
+	for range n {
+		idx := sc.markCount
+		sc.markCount++
+		for len(sc.boxes) <= idx {
+			sc.boxes = append(sc.boxes, nil)
+		}
+		sc.boxes[idx] = &shareBox{filled: true, opaque: true}
+	}
+}
+
+// parseShareableValue handles tag 28 after its tag head is consumed: it
+// assigns the next zero-based index in the current namespace, decodes the
+// tagged content into the box (which may already exist due to forward
+// references), and resolves every waiting reference to it.
+func (d *decoder) parseShareableValue(v reflect.Value, tInfo *typeInfo) error {
+	sc := d.sharing.scope()
+	index := sc.markCount
+	sc.markCount++
+
+	for len(sc.boxes) <= index {
+		sc.boxes = append(sc.boxes, nil)
+	}
+	box := sc.boxes[index]
+	if box == nil {
+		box = newShareBox(v.Type())
+		sc.boxes[index] = box
+	} else {
+		if box.opaque {
+			return &SharedReferenceError{msg: fmt.Sprintf(
+				"shareable index %d collides with a value inside a Marshaler boundary", index)}
+		}
+		if !box.typ.AssignableTo(v.Type()) {
+			return &SharedReferenceError{msg: fmt.Sprintf(
+				"shareable index %d carries Go value of type %s, incompatible with %s",
+				index, box.typ, v.Type())}
+		}
+	}
+
+	// Preallocate pointer levels so cyclic references can point back into
+	// the exact value being decoded.
+	for pv := box.elem; pv.Kind() == reflect.Pointer; pv = pv.Elem() {
+		if pv.IsNil() {
+			if !pv.CanSet() {
+				return &SharedReferenceError{msg: "cannot allocate pointer for shareable value"}
+			}
+			pv.Set(reflect.New(pv.Type().Elem()))
+		}
+	}
+
+	boxTypeInfo := tInfo
+	if boxTypeInfo == nil || boxTypeInfo.typ != box.typ {
+		boxTypeInfo = getTypeInfo(box.typ)
+	}
+	// The shareable content is nested below any enclosing map-value site,
+	// so references inside it set their own positions rather than
+	// re-inserting the whole map value.
+	d.sharing.pushSite(decodeSite{})
+	parseErr := d.parseToValue(box.elem, boxTypeInfo)
+	d.sharing.popSite()
+	if parseErr != nil {
+		return parseErr
+	}
+
+	box.filled = true
+	if v.CanSet() {
+		v.Set(box.elem)
+	}
+
+	callbacks := box.callbacks
+	box.callbacks = nil
+	for _, cb := range callbacks {
+		cb(box.elem)
+	}
+	return nil
+}
+
+// parseSharedRefValue handles tag 29 after its tag head is consumed.  The
+// tag content must be a single unsigned integer; the referenced shareable
+// value is either assigned immediately (backward reference) or the
+// assignment is deferred until its tag 28 is decoded (forward reference).
+func (d *decoder) parseSharedRefValue(v reflect.Value) error {
+	t, _, val := d.readHead()
+	if t != cborTypePositiveInt {
+		return &SharedReferenceError{msg: "shared reference (tag 29) must enclose an unsigned integer index, but got " + t.String()}
+	}
+	if uint64(int(val)) != val { //nolint:gosec
+		return &SharedReferenceError{msg: fmt.Sprintf("shared reference index %d overflows int", val)}
+	}
+	index := int(val) //nolint:gosec
+
+	sc := d.sharing.scope()
+	box, err := sc.ensureBox(index, v.Type())
+	if err != nil {
+		return err
+	}
+	if box.opaque {
+		return &SharedReferenceError{msg: fmt.Sprintf(
+			"shared reference index %d points into a Marshaler boundary and can't be resolved", index)}
+	}
+
+	if box.filled {
+		if !v.CanSet() {
+			return &SharedReferenceError{msg: "cannot set referenced value at target position"}
+		}
+		v.Set(box.elem)
+		return nil
+	}
+
+	// Forward reference: defer assigning this position.
+	if site := d.sharing.site(); site != nil && site.assign != nil {
+		assign := site.assign
+		box.callbacks = append(box.callbacks, func(fill reflect.Value) {
+			assign(fill)
+		})
+		return nil
+	}
+	if !v.CanSet() {
+		return &SharedReferenceError{msg: fmt.Sprintf(
+			"forward shared reference index %d can't be inserted at an unaddressable position", index)}
+	}
+	target := v
+	box.callbacks = append(box.callbacks, func(fill reflect.Value) {
+		target.Set(fill)
+	})
+	return nil
+}
+
+// parseSharedNamespace handles tag 296 after its tag head is consumed: the
+// following single data item is decoded in a fresh nested namespace whose
+// indices are independent of the surrounding namespace.
+func (d *decoder) parseSharedNamespace(v reflect.Value, tInfo *typeInfo) error {
+	st := d.sharing
+	st.pushScope()
+	err := d.parseToValue(v, tInfo)
+	st.popScope()
+	return err
+}
+
+// checkSharingResolved fails when some shared references could not be
+// resolved within the data item (e.g. an index without a matching tag 28).
+func (d *decoder) checkSharingResolved() error {
+	if d.sharing == nil {
+		return nil
+	}
+	for si := range d.sharing.scopes {
+		sc := &d.sharing.scopes[si]
+		for i, b := range sc.boxes {
+			if b != nil && !b.opaque && len(b.callbacks) > 0 {
+				return &SharedReferenceError{msg: fmt.Sprintf(
+					"shared reference index %d has no matching shareable value (tag 28)", i)}
+			}
+		}
+	}
+	return nil
 }
 
 func (d *decoder) nextCBORType() cborType {

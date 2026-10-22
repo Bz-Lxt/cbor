@@ -202,16 +202,19 @@ func (enc *Encoder) Encode(v any) error {
 
 	bp := getEncodeBuffer()
 
+	// Use a fresh identity table per written data item so consecutive
+	// Encode calls never leak shareable indices between each other.
+	runEM := enc.em.beginEncodeRun()
 	rv := reflect.ValueOf(v)
 
 	var b []byte
 	var handled bool
 	var err error
-	if tryFastPath(rv) {
-		b, handled, err = fastEncode(*bp, enc.em, v)
+	if tryFastPath(rv) && runEM.encSharing == nil {
+		b, handled, err = fastEncode(*bp, runEM, v)
 	}
 	if !handled {
-		b, err = encode(*bp, enc.em, rv)
+		b, err = encode(*bp, runEM, rv)
 	}
 	*bp = b[:0]
 

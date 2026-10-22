@@ -6307,6 +6307,7 @@ func TestEncOptions(t *testing.T) {
 		BinaryMarshaler:         BinaryMarshalerNone,
 		TextMarshaler:           TextMarshalerTextString,
 		JSONMarshalerTranscoder: stubTranscoder{},
+		ValueSharing:            ValueSharingAllowed,
 	}
 	ov := reflect.ValueOf(opts1)
 	for i := range ov.NumField() {
